@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。所有 API 请求（`/health` 除外）还会自动记录 **request_id、方法、路径、状态码与耗时**到 SQLite，可通过**耗时查询接口**按时间范围与路径前缀统计 p50/p95。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -89,8 +89,77 @@ docker compose up --build
 | GET  | `/api/v1/fixtures/{name}` | 按名称查询样例（跨设备类型重名时用 `?device_type=` 消歧，否则返回 409） |
 | DELETE | `/api/v1/fixtures/{name}` | 删除样例（消歧规则同上） |
 | POST | `/api/v1/fixtures/{name}/run` | 运行回归样例：用现有解析器重新解析并与基线快照逐字段比较 |
+| GET  | `/api/v1/observability/latency` | 请求耗时统计：按半开时间范围与路径前缀查询总数/错误数/p50/p95/状态码分组 |
 
 > 停用后的定义不参与列表（默认）和 latest 查询，但仍可按显式版本解析/编码历史报文。
+
+## 请求耗时追踪
+
+服务为除 `GET /health` 外的**每个 API 请求**记录一条耗时数据到 SQLite（`request_latency` 表，启动时自动创建）：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `request_id` | 服务为本次请求生成的 UUID，同时通过响应头 `X-Request-ID` 返回 |
+| `method` / `path` | HTTP 方法与实际请求路径（如 `/api/v1/parse`、未注册路径的 404 也会记录） |
+| `status_code` | 最终响应状态码（含处理器抛出未捕获异常时的 500） |
+| `started_at` / `ended_at` | UTC ISO-8601 时间戳 |
+| `duration_ms` | 服务端处理耗时（毫秒，浮点） |
+
+记录写入是**尽力而为**的：任何持久化失败（数据库被锁、磁盘满等）只写日志，绝不改变原接口的状态码与响应体。`/health` 健康检查不记录，避免探活流量污染统计。
+
+**查询接口 `GET /api/v1/observability/latency`**
+
+| 参数 | 说明 |
+| ---- | ---- |
+| `start` | 起始时间（**含**），ISO-8601，如 `2026-09-22T00:00:00Z`；省略表示不设下限 |
+| `end` | 结束时间（**不含**），ISO-8601；时间区间为半开 `[start, end)` |
+| `path_prefix` | 仅统计路径以该前缀开头的请求（字面匹配，`%`/`_` 不会被当通配符） |
+
+时间戳非法（含空字符串）返回 **422**；不带时区的时间戳按 UTC 处理。p50/p95 采用**最近秩（nearest-rank）**算法按 `duration_ms` 计算；区间内无请求时两者为 `null`。`error_count` 统计状态码 `>= 400` 的请求，`status_codes` 按状态码分组计数。
+
+```bash
+# 查询 2026-09-22 全天（UTC，半开区间）/api/v1/parse 的耗时
+curl -G http://localhost:8000/api/v1/observability/latency \
+  --data-urlencode "start=2026-09-22T00:00:00Z" \
+  --data-urlencode "end=2026-09-23T00:00:00Z" \
+  --data-urlencode "path_prefix=/api/v1/parse"
+```
+
+响应示例：
+
+```json
+{
+  "start": "2026-09-22T00:00:00+00:00",
+  "end": "2026-09-23T00:00:00+00:00",
+  "path_prefix": "/api/v1/parse",
+  "total": 12,
+  "error_count": 2,
+  "p50_ms": 3.417,
+  "p95_ms": 18.205,
+  "status_codes": [
+    {"status_code": 200, "count": 10},
+    {"status_code": 422, "count": 2}
+  ]
+}
+```
+
+非法时间戳返回 422：
+
+```bash
+curl -i -G http://localhost:8000/api/v1/observability/latency \
+  --data-urlencode "start=not-a-timestamp"
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"start is not a valid ISO-8601 timestamp: 'not-a-timestamp'"}
+```
+
+发起任意 API 请求后，可在响应头看到用于关联的 request id：
+
+```bash
+curl -i http://localhost:8000/api/v1/definitions | grep -i x-request-id
+# x-request-id: 7f1d9c4a6e3b4d2e9f5a8c1b0d6e7f20
+```
+
+> 查询接口自身也是普通 API 请求，因此同样会被记录（用 `path_prefix=/api/v1/observability` 可单独统计它）。
 
 ## curl 示例
 
@@ -820,8 +889,9 @@ app/
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   profiler.py   # 批量报文统计画像（按版本隔离、字段出现次数、标量/重复元素 min/max/mean）
+  observability.py # 请求耗时追踪（中间件尽力记录、X-Request-ID、p50/p95 查询接口）
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
-  database.py   # SQLite 持久化（definitions / fixtures 两表，启动自动建表）
+  database.py   # SQLite 持久化（definitions / fixtures / request_latency 三表，启动自动建表）
 tests/test_api.py
 Dockerfile
 docker-compose.yml
@@ -831,8 +901,9 @@ docker-compose.yml
 
 `Dockerfile` 基于 `python:3.12-slim`，仅安装运行依赖（`requirements.txt`），启动命令为
 `uvicorn app.main:app --host 0.0.0.0 --port 8000`。`docker-compose.yml` 将容器内数据库
-`/data/parser.db` 挂载到 named volume `parser-data`，因此注册的报文定义与回归样例在容器
-重建后仍然保留；首次启动时两表（`definitions`、`fixtures`）自动创建，无需手动迁移。
+`/data/parser.db` 挂载到 named volume `parser-data`，因此注册的报文定义、回归样例与请求耗时记录
+在容器重建后仍然保留；首次启动时三张表（`definitions`、`fixtures`、`request_latency`）自动创建，
+无需手动迁移。
 
 ```bash
 # 启动（首次自动构建镜像）

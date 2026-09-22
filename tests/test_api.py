@@ -3114,3 +3114,237 @@ def test_messages_profile_accepts_exactly_500_samples_without_aborting():
     assert data["rejected_count"] == 250
     assert [r["index"] for r in data["rejected"]] == list(range(250, 500))
 
+
+
+# ------------------------------------------------- request latency --
+
+import uuid  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from app import database  # noqa: E402
+
+
+def _latency_rows(prefix: str):
+    """Direct DB view of recorded requests for one unique path prefix."""
+    with database._connect() as conn:
+        return conn.execute(
+            "SELECT * FROM request_latency WHERE path LIKE ? ORDER BY id",
+            (prefix + "%",),
+        ).fetchall()
+
+
+def test_health_is_not_recorded():
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    # /health must never land in the latency table (no path can start with it).
+    with database._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM request_latency WHERE path = '/health'"
+        ).fetchone()[0]
+    assert count == 0
+
+
+def test_non_get_on_health_path_is_recorded():
+    # Only the successful GET probe is skipped; a 405 on the path is tracked.
+    resp = client.put("/health")
+    assert resp.status_code == 405
+    with database._connect() as conn:
+        row = conn.execute(
+            "SELECT method, status_code FROM request_latency "
+            "WHERE path = '/health' AND method = 'PUT'"
+        ).fetchone()
+    assert row is not None
+    assert row["status_code"] == 405
+
+
+def test_api_request_is_recorded_with_request_id_header():
+    prefix = f"/api/v1/_lat_test_tracked_{uuid.uuid4().hex}"
+    resp = client.get(prefix)
+    assert resp.status_code == 404
+
+    rows = _latency_rows(prefix)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["method"] == "GET"
+    assert row["path"] == prefix
+    assert row["status_code"] == 404
+    assert row["request_id"] == resp.headers["x-request-id"]
+    assert row["duration_ms"] >= 0
+    assert row["started_at"] <= row["ended_at"]
+    # ISO-8601 UTC timestamps with explicit offset.
+    assert row["started_at"].endswith("+00:00")
+    datetime.fromisoformat(row["started_at"])
+    datetime.fromisoformat(row["ended_at"])
+
+
+def test_post_request_method_and_success_status_are_recorded():
+    prefix = f"/api/v1/_lat_test_post_{uuid.uuid4().hex}"
+    # 422 body validation error: reaches the route and records POST + 422.
+    resp = client.post(prefix, json={})
+    assert resp.status_code == 404
+    row = _latency_rows(prefix)[0]
+    assert row["method"] == "POST"
+    assert row["status_code"] == 404
+
+
+def test_latency_endpoint_includes_itself_and_returns_aggregates():
+    prefix = f"/api/v1/_lat_test_self_{uuid.uuid4().hex}"
+    for _ in range(2):
+        client.get(prefix)  # 404s
+    resp = client.get(
+        "/api/v1/observability/latency", params={"path_prefix": prefix}
+    )
+    # The query itself is recorded too, but under a different prefix.
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["path_prefix"] == prefix
+    assert data["total"] == 2
+    assert data["error_count"] == 2
+    assert data["p50_ms"] is not None
+    assert data["p95_ms"] >= data["p50_ms"]
+    assert data["status_codes"] == [{"status_code": 404, "count": 2}]
+
+
+def test_latency_half_open_time_range():
+    base = datetime(2025, 3, 14, 9, 0, 0, tzinfo=timezone.utc)
+    tag = uuid.uuid4().hex
+    for i in range(4):
+        t = base + timedelta(seconds=i * 30)
+        database.record_request_latency(
+            request_id=f"{tag}-{i}",
+            method="GET",
+            path=f"/api/v1/_lat_range_{tag}",
+            status_code=200,
+            started_at=t.isoformat(),
+            ended_at=(t + timedelta(seconds=1)).isoformat(),
+            duration_ms=10.0 + i,
+        )
+
+    # start inclusive: the base instant request is counted.
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "path_prefix": f"/api/v1/_lat_range_{tag}",
+            "start": base.isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert resp.json()["total"] == 4
+    assert resp.json()["start"].endswith("+00:00")
+
+    # end exclusive: request at 90s excluded.
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "path_prefix": f"/api/v1/_lat_range_{tag}",
+            "start": base.isoformat(),
+            "end": (base + timedelta(seconds=90)).isoformat(),
+        },
+    )
+    data = resp.json()
+    assert data["total"] == 3
+    # durations 10, 11, 12 -> p50 nearest-rank = 11, p95 = 12
+    assert data["p50_ms"] == 11.0
+    assert data["p95_ms"] == 12.0
+
+    # Empty half-open slice.
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "path_prefix": f"/api/v1/_lat_range_{tag}",
+            "start": "2026-01-01T00:00:00+00:00",
+            "end": "2026-01-02T00:00:00+00:00",
+        },
+    )
+    data = resp.json()
+    assert data["total"] == 0
+    assert data["error_count"] == 0
+    assert data["p50_ms"] is None
+    assert data["p95_ms"] is None
+    assert data["status_codes"] == []
+
+
+def test_latency_path_prefix_matches_literally():
+    tag = uuid.uuid4().hex
+    database.record_request_latency(
+        request_id=tag, method="GET", path=f"/api/v1/_lat_lit{tag}/a",
+        status_code=200, started_at="2025-01-01T00:00:00+00:00",
+        ended_at="2025-01-01T00:00:01+00:00", duration_ms=1.0,
+    )
+    stats = database.latency_stats(path_prefix=f"/api/v1/_lat_lit{tag}/a")
+    assert stats["total"] == 1
+    # Trailing underscore must not act as a LIKE wildcard.
+    stats = database.latency_stats(path_prefix=f"/api/v1/_lat_lit{tag}/x")
+    assert stats["total"] == 0
+
+
+def test_latency_percentiles_nearest_rank():
+    tag = uuid.uuid4().hex
+    # 10 requests, durations 10..100 ms; one error.
+    for i in range(10):
+        database.record_request_latency(
+            request_id=f"{tag}-{i}", method="GET",
+            path=f"/api/v1/_lat_pct_{tag}",
+            status_code=500 if i == 9 else 200,
+            started_at=f"2025-05-01T00:00:{i:02d}+00:00",
+            ended_at=f"2025-05-01T00:00:{i:02d}+00:00",
+            duration_ms=float((i + 1) * 10),
+        )
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={"path_prefix": f"/api/v1/_lat_pct_{tag}"},
+    )
+    data = resp.json()
+    assert data["total"] == 10
+    assert data["error_count"] == 1
+    assert data["p50_ms"] == 50.0   # rank 5
+    assert data["p95_ms"] == 100.0  # rank ceil(0.95*10) = 10
+    assert data["status_codes"] == [
+        {"status_code": 200, "count": 9},
+        {"status_code": 500, "count": 1},
+    ]
+
+
+def test_latency_invalid_timestamps_return_422():
+    for param in ("start", "end"):
+        resp = client.get(
+            "/api/v1/observability/latency", params={param: "not-a-timestamp"}
+        )
+        assert resp.status_code == 422
+        assert param in resp.json()["detail"]
+
+    resp = client.get(
+        "/api/v1/observability/latency", params={"start": "2025-13-99T99:99:99Z"}
+    )
+    assert resp.status_code == 422
+
+    # Empty value is also rejected.
+    resp = client.get("/api/v1/observability/latency?start=")
+    assert resp.status_code == 422
+
+
+def test_latency_recording_failure_never_breaks_response(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated sqlite failure")
+
+    monkeypatch.setattr(database, "record_request_latency", boom)
+    prefix = f"/api/v1/_lat_test_failopen_{uuid.uuid4().hex}"
+    resp = client.get(prefix)
+    assert resp.status_code == 404
+    # Still tagged with a request id even when persistence fails.
+    assert resp.headers.get("x-request-id")
+
+
+def test_unhandled_server_error_is_recorded_with_500():
+    route = f"/api/v1/_lat_boom_{uuid.uuid4().hex}"
+
+    @app.get(route)
+    def _boom():
+        raise RuntimeError("kaboom")
+
+    with TestClient(app, raise_server_exceptions=False) as failing_client:
+        resp = failing_client.get(route)
+        assert resp.status_code == 500
+
+    rows = _latency_rows(route)
+    assert len(rows) == 1
+    assert rows[0]["status_code"] == 500

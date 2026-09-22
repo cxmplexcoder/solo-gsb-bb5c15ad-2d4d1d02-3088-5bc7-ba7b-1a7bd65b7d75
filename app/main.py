@@ -23,6 +23,7 @@ from .framing import (
 )
 from .parser import ParseError, parse_message
 from .profiler import VersionProfile
+from .observability import RequestLatencyMiddleware, router as observability_router
 from .schemas import (
     CompatibilityRequest,
     DefinitionCreate,
@@ -79,6 +80,12 @@ app = FastAPI(
 
 # Make the service usable even if the lifespan hook is bypassed (e.g. tests).
 database.init_db()
+
+# Best-effort request latency recording for every API request except /health
+# (see app/observability.py). Added before routes are served; a failed
+# write never affects the tracked response.
+app.add_middleware(RequestLatencyMiddleware)
+app.include_router(observability_router, prefix="/api/v1", tags=["observability"])
 
 
 @app.get("/health")

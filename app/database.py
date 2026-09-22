@@ -1,6 +1,7 @@
 """SQLite persistence, auto-initialized on startup."""
 
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -30,6 +31,22 @@ CREATE TABLE IF NOT EXISTS fixtures (
     created_at  TEXT    NOT NULL,
     UNIQUE (device_type, name)
 );
+
+CREATE TABLE IF NOT EXISTS request_latency (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  TEXT    NOT NULL,
+    method      TEXT    NOT NULL,
+    path        TEXT    NOT NULL,
+    status_code INTEGER NOT NULL,
+    started_at  TEXT    NOT NULL,
+    ended_at    TEXT    NOT NULL,
+    duration_ms REAL    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_request_latency_started_at
+    ON request_latency (started_at);
+CREATE INDEX IF NOT EXISTS idx_request_latency_path
+    ON request_latency (path);
 """
 
 
@@ -217,3 +234,98 @@ def delete_fixture(device_type: str, name: str) -> bool:
             (device_type, name),
         )
     return cursor.rowcount > 0
+
+
+# ------------------------------------------------------- request latency --
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE meta characters so a path prefix matches literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def record_request_latency(
+    request_id: str,
+    method: str,
+    path: str,
+    status_code: int,
+    started_at: str,
+    ended_at: str,
+    duration_ms: float,
+) -> None:
+    """Persist one completed API request. Callers must swallow exceptions:
+    observability bookkeeping must never affect the tracked response."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO request_latency "
+            "(request_id, method, path, status_code, started_at, ended_at, duration_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (request_id, method, path, status_code, started_at, ended_at, duration_ms),
+        )
+
+
+def _percentile(sorted_values: List[float], percentile: float) -> Optional[float]:
+    """Nearest-rank percentile (rank = ceil(p/100 * n)) over sorted values."""
+    if not sorted_values:
+        return None
+    rank = math.ceil(percentile / 100.0 * len(sorted_values))
+    return sorted_values[max(rank, 1) - 1]
+
+
+def latency_stats(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    path_prefix: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aggregate recorded requests over a half-open [start, end) interval
+    (matched on started_at) and an optional literal path prefix.
+
+    ``p50``/``p95`` use the nearest-rank method over ``duration_ms`` and
+    are ``None`` when the interval contains no requests.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if start is not None:
+        clauses.append("started_at >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("started_at < ?")
+        params.append(end)
+    if path_prefix:
+        clauses.append("path LIKE ? ESCAPE '\\'")
+        params.append(_escape_like(path_prefix) + "%")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with _connect() as conn:
+        total, error_count = conn.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0)"
+            f" FROM request_latency{where}",
+            params,
+        ).fetchone()
+        status_rows = conn.execute(
+            f"SELECT status_code, COUNT(*) AS count FROM request_latency{where}"
+            f" GROUP BY status_code ORDER BY status_code",
+            params,
+        ).fetchall()
+        durations = [
+            row[0]
+            for row in conn.execute(
+                f"SELECT duration_ms FROM request_latency{where} ORDER BY duration_ms",
+                params,
+            ).fetchall()
+        ]
+
+    return {
+        "total": total,
+        "error_count": error_count,
+        "p50_ms": _round_ms(_percentile(durations, 50)),
+        "p95_ms": _round_ms(_percentile(durations, 95)),
+        "status_codes": [
+            {"status_code": row["status_code"], "count": row["count"]}
+            for row in status_rows
+        ],
+    }
+
+
+def _round_ms(value: Optional[float]) -> Optional[float]:
+    return None if value is None else round(value, 3)
