@@ -10,6 +10,7 @@ from . import database
 from .analyzer import CompatibilityError, analyze_compatibility
 from .encoder import EncodeError, encode_message
 from .fixtures import capture_snapshot, compare_snapshots, verify_expectation
+from .observability import LatencyTrackingMiddleware, router as observability_router
 from .framing import (
     MAX_BUFFER_SIZE,
     MAX_FRAME_SIZE,
@@ -79,6 +80,12 @@ app = FastAPI(
 
 # Make the service usable even if the lifespan hook is bypassed (e.g. tests).
 database.init_db()
+
+# Record request latency for every API request except /health. Failures while
+# writing a record are contained inside the middleware and never alter the
+# traced response.
+app.add_middleware(LatencyTrackingMiddleware)
+app.include_router(observability_router)
 
 
 @app.get("/health")

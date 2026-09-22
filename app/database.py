@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS fixtures (
     created_at  TEXT    NOT NULL,
     UNIQUE (device_type, name)
 );
+
+CREATE TABLE IF NOT EXISTS request_latency (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id    TEXT    NOT NULL,
+    method        TEXT    NOT NULL,
+    path          TEXT    NOT NULL,
+    status_code   INTEGER NOT NULL,
+    started_at    TEXT    NOT NULL,
+    ended_at      TEXT    NOT NULL,
+    duration_ms   REAL    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_request_latency_started_at
+    ON request_latency (started_at);
 """
 
 
@@ -217,3 +231,66 @@ def delete_fixture(device_type: str, name: str) -> bool:
             (device_type, name),
         )
     return cursor.rowcount > 0
+
+
+# --------------------------------------------------------- request latency --
+
+
+def record_request_latency(
+    request_id: str,
+    method: str,
+    path: str,
+    status_code: int,
+    started_at: str,
+    ended_at: str,
+    duration_ms: float,
+) -> None:
+    """Persist one API request timing record. Called by the latency-tracking
+    middleware; failures propagate to the caller, which must never let them
+    affect the original response."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO request_latency"
+            " (request_id, method, path, status_code, started_at, ended_at, duration_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (request_id, method, path, status_code, started_at, ended_at, duration_ms),
+        )
+
+
+def list_request_latency(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    path_prefix: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return latency rows matching the filters. Time filtering uses the
+    half-open interval [start, end). Timestamps are normalized UTC ISO-8601
+    strings of fixed width, so lexicographic comparison equals chronological
+    order; ``path`` is filtered by a plain string-prefix match."""
+    clauses, params = [], []
+    if start is not None:
+        clauses.append("started_at >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("started_at < ?")
+        params.append(end)
+    if path_prefix:
+        clauses.append("substr(path, 1, length(?)) = ?")
+        params.extend((path_prefix, path_prefix))
+    query = "SELECT * FROM request_latency"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY started_at, id"
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [
+        {
+            "request_id": row["request_id"],
+            "method": row["method"],
+            "path": row["path"],
+            "status_code": row["status_code"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "duration_ms": row["duration_ms"],
+        }
+        for row in rows
+    ]

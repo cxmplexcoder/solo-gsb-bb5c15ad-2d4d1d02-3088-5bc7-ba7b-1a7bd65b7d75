@@ -1,6 +1,6 @@
 # 工业二进制报文解析 API
 
-基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。SQLite 持久化，启动时自动建表。
+基于 FastAPI 的工业二进制报文解析服务。用户注册**带版本的报文定义**（位宽、端序、条件分支、计数驱动的重复字段、校验字段），提交指定版本的十六进制报文后，服务按位解析、验证校验和，并返回字段值、位偏移及实际分支路径；反向地，也可以提交字段值**编码**出十六进制报文（校验和自动计算写入）。对于串口/TCP 式的**分块字节流**，还可以提交十六进制分块数组，由同步头与长度字段自动分帧、跨块重组、剔除噪声并逐帧解析。此外支持保存**解析回归样例**：把报文与基线字段快照存入 SQLite，版本升级后对新版本重跑并逐字段比对差异。需要快速掌握一批报文的字段画像时，可用**批量报文统计画像**接口一次提交 1～500 条报文，按版本给出接收/拒绝情况与各字段的出现次数、最小/最大/均值。服务还内置**请求耗时追踪**：除 `/health` 外的每个 API 请求都会把 request_id、方法、路径、状态码、起止时间与耗时写入 SQLite，可通过可观测性接口按时间范围和路径前缀查询总数、错误数、p50/p95 耗时及按状态码分组统计。SQLite 持久化，启动时自动建表。
 
 ## 快速启动
 
@@ -89,6 +89,7 @@ docker compose up --build
 | GET  | `/api/v1/fixtures/{name}` | 按名称查询样例（跨设备类型重名时用 `?device_type=` 消歧，否则返回 409） |
 | DELETE | `/api/v1/fixtures/{name}` | 删除样例（消歧规则同上） |
 | POST | `/api/v1/fixtures/{name}/run` | 运行回归样例：用现有解析器重新解析并与基线快照逐字段比较 |
+| GET  | `/api/v1/observability/latency` | 请求耗时统计：按半开时间范围 `[start, end)` 与路径前缀查询总数、错误数、p50/p95 及状态码分组 |
 
 > 停用后的定义不参与列表（默认）和 latest 查询，但仍可按显式版本解析/编码历史报文。
 
@@ -800,6 +801,76 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST \
 
 > 注意区分两种 `404`：路径完全未注册时 FastAPI 返回 `{"detail":"Not Found"}`；本路由在线但 `device_type` 下没有任何已注册版本（含停用）时返回 `{"detail":"no definitions found for device type '...'"}`。正常使用流程是先 `POST /api/v1/definitions` 注册至少一个版本，再批量提交样本，此时返回 `200`。
 
+### 11. 请求耗时追踪（/observability/latency）
+
+服务内置请求耗时追踪中间件：**除 `/health` 外的每个 HTTP 请求**（含 4xx/5xx、路由未命中的 404）都会在响应完成后写入一条记录到 SQLite 表 `request_latency`，字段为：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `request_id` | 每个请求生成的 UUID（同时通过响应头 `X-Request-ID` 返回，便于关联日志） |
+| `method` / `path` | HTTP 方法与**实际请求路径**（如 `/api/v1/definitions/temp_sensor/1.0.0`，非路由模板） |
+| `status_code` | 响应状态码 |
+| `started_at` / `ended_at` | 请求开始 / 结束时间，UTC ISO-8601（微秒精度） |
+| `duration_ms` | 耗时，毫秒（单调时钟 `perf_counter` 计时，保留 3 位小数） |
+
+> 追踪写入是**尽力而为**的：持久化失败只记录日志，绝不改变原接口的状态码与响应体；即使 SQLite 不可用，业务接口仍正常工作。`/health` 不追踪、也不返回 `X-Request-ID`，保证存活探针始终轻量可用。
+
+**查询接口**
+
+```
+GET /api/v1/observability/latency?start=...&end=...&path_prefix=...
+```
+
+| 参数 | 必填 | 说明 |
+| ---- | ---- | ---- |
+| `start` | 否 | 时间范围起点（**包含**），ISO-8601，如 `2026-09-22T00:00:00Z`；不带时区的朴素时间按 UTC 处理 |
+| `end` | 否 | 时间范围终点（**不包含**），格式同 `start` |
+| `path_prefix` | 否 | 仅统计路径以该前缀开头的请求（纯字符串前缀匹配，如 `/api/v1/parse`） |
+
+- 时间范围是**半开区间 `[start, end)`**：以**请求开始时间** `started_at` 过滤，恰好在 `start` 时刻的请求计入，恰好在 `end` 时刻的请求不计入。两个参数都可省略（省略端表示不限制该侧）。
+- 时间戳不是合法 ISO-8601（如 `not-a-time`、Unix 秒 `1700000000`、`2026-13-99`）返回 **422**；`start >= end`（含两者相等，半开区间为空无意义）同样返回 **422**。
+- 错误数口径为 `status_code >= 400`；p50/p95 采用**最近秩（nearest-rank）**算法，结果为某个实际样本值，不做插值；窗口内无请求时 p50/p95 为 `null`。
+
+```bash
+# 查询某一天 /api/v1 下全部请求的耗时统计
+curl -sG 'http://localhost:8000/api/v1/observability/latency' \
+  --data-urlencode 'start=2026-09-22T00:00:00Z' \
+  --data-urlencode 'end=2026-09-23T00:00:00Z' \
+  --data-urlencode 'path_prefix=/api/v1'
+```
+
+响应示例：
+
+```json
+{
+  "filters": {
+    "start": "2026-09-22T00:00:00.000000+00:00",
+    "end": "2026-09-23T00:00:00.000000+00:00",
+    "path_prefix": "/api/v1"
+  },
+  "total_requests": 4,
+  "error_requests": 2,
+  "latency_ms": {"p50": 2.15, "p95": 8.42},
+  "status_codes": [
+    {"status_code": 200, "count": 2},
+    {"status_code": 404, "count": 1},
+    {"status_code": 422, "count": 1}
+  ]
+}
+```
+
+非法时间戳的 422 响应示例：
+
+```json
+{"detail": "start must be an ISO-8601 timestamp (e.g. 2026-09-22T00:00:00Z), got 'not-a-time'"}
+```
+
+```json
+{"detail": "start must be earlier than end (time range is half-open [start, end))"}
+```
+
+耗时记录与业务数据存放在同一个 SQLite 数据库（`request_latency` 表，`started_at` 上有索引），随 named volume `parser-data` 一起持久化；首次启动自动建表，无需手动迁移。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -820,8 +891,9 @@ app/
   analyzer.py   # 版本兼容性分析（条件等价类划分、可达分支枚举、布局比对；遇 repeat 拒绝分析）
   fixtures.py   # 回归样例：基线快照捕获、expect 断言、逐字段 added/removed/changed 比较
   profiler.py   # 批量报文统计画像（按版本隔离、字段出现次数、标量/重复元素 min/max/mean）
+  observability.py # 请求耗时追踪中间件 + GET /api/v1/observability/latency 聚合统计
   checksum.py   # sum8 / xor8 / crc16-ccitt / crc16-modbus
-  database.py   # SQLite 持久化（definitions / fixtures 两表，启动自动建表）
+  database.py   # SQLite 持久化（definitions / fixtures / request_latency 三表，启动自动建表）
 tests/test_api.py
 Dockerfile
 docker-compose.yml
@@ -831,8 +903,8 @@ docker-compose.yml
 
 `Dockerfile` 基于 `python:3.12-slim`，仅安装运行依赖（`requirements.txt`），启动命令为
 `uvicorn app.main:app --host 0.0.0.0 --port 8000`。`docker-compose.yml` 将容器内数据库
-`/data/parser.db` 挂载到 named volume `parser-data`，因此注册的报文定义与回归样例在容器
-重建后仍然保留；首次启动时两表（`definitions`、`fixtures`）自动创建，无需手动迁移。
+`/data/parser.db` 挂载到 named volume `parser-data`，因此注册的报文定义、回归样例与**请求耗时记录**在容器
+重建后仍然保留；首次启动时三张表（`definitions`、`fixtures`、`request_latency`）自动创建，无需手动迁移。
 
 ```bash
 # 启动（首次自动构建镜像）
@@ -847,4 +919,17 @@ docker compose down            # 不删除数据卷；加 -v 才会清空 parser
 docker build -t msg-parser .
 docker run -p 8000:8000 -e DB_PATH=/data/parser.db \
   -v parser-data:/data msg-parser
+```
+
+启动后可产生并查询请求耗时记录（`/health` 不会被记录）：
+
+```bash
+# 触发若干业务请求（响应头 X-Request-ID 即该请求的 request_id）
+curl -s http://localhost:8000/api/v1/definitions -D - -o /dev/null | grep -i x-request-id
+
+# 查询最近一天 /api/v1 前缀请求的总数、错误数、p50/p95 与状态码分组
+curl -sG 'http://localhost:8000/api/v1/observability/latency' \
+  --data-urlencode 'start=2026-09-22T00:00:00Z' \
+  --data-urlencode 'end=2026-09-23T00:00:00Z' \
+  --data-urlencode 'path_prefix=/api/v1'
 ```

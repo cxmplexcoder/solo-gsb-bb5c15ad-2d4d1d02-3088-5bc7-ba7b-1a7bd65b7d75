@@ -1,5 +1,6 @@
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(prefix="parser-test-"), "test.db")
 
@@ -3114,3 +3115,200 @@ def test_messages_profile_accepts_exactly_500_samples_without_aborting():
     assert data["rejected_count"] == 250
     assert [r["index"] for r in data["rejected"]] == list(range(250, 500))
 
+
+
+# ------------------------------------------------- request latency tracing --
+
+from app import database as _lat_db  # noqa: E402
+from app.observability import format_ts, parse_ts  # noqa: E402
+
+_LAT_PREFIX = "/__latency_test__"
+# Fixed reference window; seeded rows use distinct seconds inside it so
+# half-open boundary semantics can be asserted exactly.
+_LAT_BASE = datetime(2030, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _seed_latency_row(suffix: str, method: str, status_code: int,
+                      started_at: datetime, duration_ms: float) -> None:
+    ended_at = started_at + timedelta(microseconds=int(duration_ms * 1000))
+    _lat_db.record_request_latency(
+        request_id=f"seed-{suffix}",
+        method=method,
+        path=_LAT_PREFIX + suffix,
+        status_code=status_code,
+        started_at=format_ts(started_at),
+        ended_at=format_ts(ended_at),
+        duration_ms=duration_ms,
+    )
+
+
+def _seed_latency_fixture():
+    # 5 rows: status 200 x3 (10/20/30 ms), 404 (40 ms), 500 (50 ms).
+    rows = [
+        ("/a", "GET", 200, 10.0),
+        ("/b", "GET", 200, 20.0),
+        ("/c", "POST", 200, 30.0),
+        ("/missing", "GET", 404, 40.0),
+        ("/boom", "GET", 500, 50.0),
+    ]
+    for i, (suffix, method, code, dur) in enumerate(rows):
+        _seed_latency_row(
+            suffix, method, code, _LAT_BASE + timedelta(seconds=i), dur
+        )
+
+
+def test_latency_report_basic_counts_and_percentiles():
+    _seed_latency_fixture()
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "start": "2030-01-01T12:00:00Z",
+            "end": "2030-01-01T13:00:00Z",
+            "path_prefix": _LAT_PREFIX,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_requests"] == 5
+    assert data["error_requests"] == 2
+    # nearest-rank: p50 = ceil(0.5*5)=3rd value, p95 = ceil(0.95*5)=5th
+    assert data["latency_ms"] == {"p50": 30.0, "p95": 50.0}
+    assert {c["status_code"]: c["count"] for c in data["status_codes"]} == {
+        200: 3,
+        404: 1,
+        500: 1,
+    }
+
+
+def test_latency_report_half_open_interval_boundaries():
+    # One row exactly at the window start must be included; a row exactly at
+    # the window end must be excluded (half-open [start, end)).
+    t_start = _LAT_BASE + timedelta(minutes=10)
+    t_end = t_start + timedelta(seconds=1)
+    _seed_latency_row("/edge-inclusive", "GET", 200, t_start, 1.0)
+    _seed_latency_row("/edge-exclusive", "GET", 200, t_end, 1.0)
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "start": format_ts(t_start),
+            "end": format_ts(t_end),
+            "path_prefix": _LAT_PREFIX,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    paths = {
+        r["path"]
+        for r in _lat_db.list_request_latency(
+            start=format_ts(t_start),
+            end=format_ts(t_end),
+            path_prefix=_LAT_PREFIX,
+        )
+    }
+    assert f"{_LAT_PREFIX}/edge-inclusive" in paths
+    assert f"{_LAT_PREFIX}/edge-exclusive" not in paths
+    assert resp.json()["total_requests"] == len(paths)
+
+
+def test_latency_report_path_prefix_filter():
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "start": "2030-01-01T12:00:00Z",
+            "end": "2030-01-01T13:00:00Z",
+            "path_prefix": _LAT_PREFIX + "/missing",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_requests"] == 1
+    assert data["error_requests"] == 1
+    assert data["status_codes"] == [{"status_code": 404, "count": 1}]
+
+
+def test_latency_report_invalid_timestamps_return_422():
+    resp = client.get(
+        "/api/v1/observability/latency", params={"start": "not-a-timestamp"}
+    )
+    assert resp.status_code == 422
+
+    resp = client.get(
+        "/api/v1/observability/latency", params={"end": "1700000000"}
+    )
+    assert resp.status_code == 422
+
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={"start": "2030-01-02T00:00:00Z", "end": "2030-01-01T00:00:00Z"},
+    )
+    assert resp.status_code == 422
+
+    # half-open: an empty window (start == end) is rejected
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={"start": "2030-01-01T00:00:00Z", "end": "2030-01-01T00:00:00Z"},
+    )
+    assert resp.status_code == 422
+
+
+def test_latency_report_empty_window_returns_null_percentiles():
+    resp = client.get(
+        "/api/v1/observability/latency",
+        params={
+            "start": "2000-01-01T00:00:00Z",
+            "end": "2000-01-02T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_requests"] == 0
+    assert data["error_requests"] == 0
+    assert data["latency_ms"] == {"p50": None, "p95": None}
+    assert data["status_codes"] == []
+
+
+def test_latency_middleware_records_api_requests_with_request_id():
+    # A business request (even an erroring one) is recorded and carries an
+    # X-Request-ID header.
+    resp = client.get("/api/v1/definitions/__nope__/latest")
+    assert resp.status_code == 404
+    assert resp.headers.get("X-Request-ID")
+
+    request_id = resp.headers["X-Request-ID"]
+    rows = _lat_db.list_request_latency(path_prefix="/api/v1/definitions/__nope__")
+    matches = [r for r in rows if r["request_id"] == request_id]
+    assert len(matches) == 1
+    row = matches[0]
+    assert row["method"] == "GET"
+    assert row["status_code"] == 404
+    assert row["duration_ms"] >= 0
+    assert row["started_at"] <= row["ended_at"]
+
+
+def test_latency_middleware_skips_health():
+    before = len(_lat_db.list_request_latency(path_prefix="/health"))
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    after = len(_lat_db.list_request_latency(path_prefix="/health"))
+    assert before == after == 0
+    assert "X-Request-ID" not in resp.headers
+
+
+def test_latency_recording_failure_never_breaks_response(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("sqlite is down")
+
+    monkeypatch.setattr(_lat_db, "record_request_latency", _boom)
+    # Endpoint still answers normally despite the persistence failure.
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    resp = client.get("/api/v1/definitions")
+    assert resp.status_code == 200
+
+
+def test_parse_ts_accepts_z_and_naive_as_utc():
+    assert parse_ts("2030-01-01T00:00:00Z", "start") == datetime(
+        2030, 1, 1, tzinfo=timezone.utc
+    )
+    assert parse_ts("2030-01-01T00:00:00", "start") == datetime(
+        2030, 1, 1, tzinfo=timezone.utc
+    )
